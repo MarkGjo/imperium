@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mac Control</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0a0a0a;
+            color: white;
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 30px;
+        }
+
+        .status {
+            font-size: 14px;
+            color: #888;
+            text-align: center;
+            padding: 0 20px;
+        }
+
+        .status.connected { color: #30d158; }
+        .status.listening { color: #0a84ff; }
+        .status.processing { color: #ffd60a; }
+        .status.error { color: #ff453a; }
+
+        .mic-button {
+            width: 120px;
+            height: 120px;
+            border-radius: 60px;
+            background: #1c1c1e;
+            border: 3px solid #333;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.2s;
+            -webkit-tap-highlight-color: transparent;
+            touch-action: none;
+            user-select: none;
+        }
+
+        .mic-button.listening {
+            background: #0a84ff;
+            border-color: #0a84ff;
+            box-shadow: 0 0 40px rgba(10, 132, 255, 0.5);
+            animation: pulse 1.5s infinite;
+        }
+
+        .mic-button.processing {
+            background: #ffd60a;
+            border-color: #ffd60a;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+
+        .mic-icon {
+            font-size: 48px;
+        }
+
+        .transcript {
+            background: #1c1c1e;
+            border-radius: 16px;
+            padding: 16px 20px;
+            width: 90%;
+            max-width: 400px;
+            min-height: 60px;
+            font-size: 16px;
+            color: #fff;
+            text-align: center;
+            display: none;
+        }
+
+        .response {
+            background: #1c1c1e;
+            border-radius: 16px;
+            padding: 16px 20px;
+            width: 90%;
+            max-width: 400px;
+            min-height: 60px;
+            font-size: 14px;
+            color: #30d158;
+            text-align: center;
+            display: none;
+        }
+
+        .response.fail {
+            color: #ff453a;
+            font-size: 13px;
+            text-align: left;
+            white-space: pre-wrap;
+        }
+
+        .response.bad {
+            color: #ff453a;
+            font-size: 13px;
+            text-align: left;
+        }
+
+        .transcript.bad {
+            color: #ff453a;
+            font-size: 14px;
+            text-align: left;
+        }
+
+        .title {
+            font-size: 28px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }
+
+        .subtitle {
+            font-size: 14px;
+            color: #555;
+        }
+
+        .hold-hint {
+            font-size: 13px;
+            color: #444;
+        }
+
+        .transcript.typing,
+        .response.typing {
+            opacity: 1;
+        }
+
+        .transcript.typing::after,
+        .response.typing::after {
+            content: "▎";
+            display: inline-block;
+            margin-left: 1px;
+            color: #30d158;
+            animation: caret-blink 0.55s steps(1, end) infinite;
+            vertical-align: text-bottom;
+        }
+
+        .response.fail.typing::after,
+        .response.bad.typing::after,
+        .transcript.bad.typing::after {
+            color: #ff453a;
+        }
+
+        @keyframes caret-blink {
+            50% { opacity: 0; }
+        }
+    </style>
+</head>
+<body>
+
+    <div>
+        <div class="title">Mac Control</div>
+        <div class="subtitle" style="text-align:center">Voice AI Agent</div>
+    </div>
+
+    <div class="status" id="status">Connecting to Mac...</div>
+
+    <div class="mic-button" id="micBtn">
+        <span class="mic-icon">🎤</span>
+    </div>
+
+    <div class="hold-hint">Hold 1–2 seconds, speak, then release</div>
+    <div class="hold-hint" id="macModeTag" style="display:none;color:#3a3a3c;">Mac · typing animation for type/paste actions</div>
+
+    <div class="transcript" id="transcript"></div>
+    <div class="response" id="response"></div>
+
+    <div id="filename" style="
+        color: #888;
+        font-size: 13px;
+        display: none;
+        margin-top: 10px;
+    "></div>
+
+    <div id="fileContent" style="
+        background: #1c1c1e;
+        border-radius: 12px;
+        padding: 16px;
+        width: 90%;
+        max-width: 400px;
+        max-height: 300px;
+        overflow-y: auto;
+        font-size: 13px;
+        color: #fff;
+        white-space: pre-wrap;
+        display: none;
+        margin-top: 8px;
+        font-family: monospace;
+        line-height: 1.5;
+    "></div>
+
+    <div id="truncatedNote" style="
+        color: #ffd60a;
+        font-size: 12px;
+        display: none;
+        margin-top: 4px;
+    ">Showing first 500 words — full file returned in response</div>
+
+    <script>
+        // Same host as this page (open iPhone Safari to http://YOUR_MAC_IP:8000/app/)
+        const SERVER_URL = window.location.origin;
+        // iPhone / iPod: always plain text. On Mac (or iPad), open /app/?mac=1 — typewriter for typing-related results only.
+        const isIPhoneOrPod = /iPhone|iPod/i.test(navigator.userAgent || "");
+        const MAC_TYPING_UI =
+            !isIPhoneOrPod && new URLSearchParams(location.search).get("mac") === "1";
+
+        const MIN_RECORDING_MS = 1500;
+        const MIN_AUDIO_BYTES = 800;
+
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let isRecording = false;
+        let recordingStartedAt = 0;
+        let minDurationTimer = null;
+
+        const micBtn = document.getElementById("micBtn");
+        const statusEl = document.getElementById("status");
+        const transcriptEl = document.getElementById("transcript");
+        const responseEl = document.getElementById("response");
+        const macModeTag = document.getElementById("macModeTag");
+        if (MAC_TYPING_UI && macModeTag) {
+            macModeTag.style.display = "block";
+        }
+
+        /** Separate cancel tokens so transcript + response can animate at the same time. */
+        let twTranscriptId = 0;
+        let twResponseId = 0;
+
+        function msPerCharFor(text) {
+            if (!text || !text.length) return 16;
+            const targetMs = 2400;
+            const per = Math.floor(targetMs / text.length);
+            return Math.max(5, Math.min(26, per));
+        }
+
+        /**
+         * Reveals text character-by-character. Works for any string (including newlines).
+         * @param {HTMLElement} el
+         * @param {string} text
+         * @param {{ msPerChar?: number, className?: string, onDone?: () => void }} [opts]
+         */
+        function typewriter(el, text, opts) {
+            opts = opts || {};
+            const slot = el.id === "transcript" ? "t" : "r";
+            const myId = slot === "t" ? ++twTranscriptId : ++twResponseId;
+            if (opts.className !== undefined) {
+                el.className = opts.className;
+            }
+            el.style.display = "block";
+            if (!text || text.length === 0) {
+                el.textContent = "";
+                el.classList.remove("typing");
+                if (opts.onDone) opts.onDone();
+                return;
+            }
+            el.classList.add("typing");
+            const mpc = opts.msPerChar != null ? opts.msPerChar : msPerCharFor(text);
+            let i = 0;
+            function step() {
+                const alive = slot === "t" ? myId === twTranscriptId : myId === twResponseId;
+                if (!alive) return;
+                if (i < text.length) {
+                    el.textContent = text.slice(0, i + 1);
+                    i++;
+                    setTimeout(step, mpc);
+                } else {
+                    el.textContent = text;
+                    el.classList.remove("typing");
+                    if (opts.onDone) opts.onDone();
+                }
+            }
+            step();
+        }
+
+        function shouldAnimateTyping(data) {
+            if (!MAC_TYPING_UI) return false;
+            if (!data) return false;
+            if (data.typing_ui === true) return true;
+            const blob = `${data.transcript || ""} ${data.action || ""} ${data.method || ""}`.toLowerCase();
+            return /\b(type|typing|paste|dictate|keystroke|clipboard|compose|entered|wrote|typed|pasted)\b/.test(blob)
+                || /notes_pbcopy/.test(String(data.method || ""));
+        }
+
+        function reveal(el, text, opts, data) {
+            opts = opts || {};
+            data = data || {};
+            const t = text == null ? "" : String(text);
+            if (shouldAnimateTyping(data) && t.length > 0) {
+                typewriter(el, t, opts);
+                return;
+            }
+            if (opts.className !== undefined) {
+                el.className = opts.className;
+            }
+            el.style.display = "block";
+            el.textContent = t;
+            el.classList.remove("typing");
+            if (opts.onDone) opts.onDone();
+        }
+
+        async function checkConnection() {
+            try {
+                const res = await fetch(`${SERVER_URL}/`);
+                await res.json();
+                setStatus("Mac is connected ✓", "connected");
+            } catch (err) {
+                setStatus("Cannot reach Mac — same WiFi?", "error");
+                setTimeout(checkConnection, 3000);
+            }
+        }
+
+        function setStatus(msg, type = "") {
+            statusEl.textContent = msg;
+            statusEl.className = `status ${type}`;
+        }
+
+        function micErrorMessage(err) {
+            const name = err && err.name ? err.name : "";
+            if (name === "TypeError") {
+                return "HTTPS required: Safari hides the mic API on http:// (except localhost). Use ngrok below.";
+            }
+            if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+                return "Mic blocked — Settings → Privacy → Microphone → Safari on. Reload and tap Allow.";
+            }
+            if (name === "NotFoundError") {
+                return "No microphone found on this device.";
+            }
+            if (name === "SecurityError" || name === "NotSupportedError") {
+                return "Use HTTPS (ngrok) — see message above.";
+            }
+            return `Microphone: ${name || err} — if on http://IP, switch to ngrok HTTPS.`;
+        }
+
+        async function setupMic() {
+            if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
+                setStatus(
+                    "HTTPS required: On Mac run: ngrok http 8000 — open the https://… link in Safari + add /app/ at the end.",
+                    "error"
+                );
+                return null;
+            }
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: true
+                });
+                return stream;
+            } catch (err) {
+                setStatus(micErrorMessage(err), "error");
+                return null;
+            }
+        }
+
+        async function startRecording() {
+            if (isRecording) return;
+            clearMinDurationTimer();
+
+            const stream = await setupMic();
+            if (!stream) return;
+
+            audioChunks = [];
+            let mime = "";
+            if (MediaRecorder.isTypeSupported("audio/webm")) mime = "audio/webm";
+            else if (MediaRecorder.isTypeSupported("audio/mp4")) mime = "audio/mp4";
+            mediaRecorder = mime
+                ? new MediaRecorder(stream, { mimeType: mime })
+                : new MediaRecorder(stream);
+
+            mediaRecorder.ondataavailable = (e) => {
+                if (e.data.size > 0) audioChunks.push(e.data);
+            };
+
+            mediaRecorder.onstop = async () => {
+                let blobType = (mediaRecorder.mimeType || "").trim();
+                // iOS Safari often records MP4/AAC but leaves mimeType empty — default to MP4
+                if (!blobType) {
+                    const ua = navigator.userAgent || "";
+                    const isApple = /iPhone|iPad|iPod|Macintosh/.test(ua);
+                    blobType = isApple ? "audio/mp4" : "audio/webm";
+                }
+                const audioBlob = new Blob(audioChunks, { type: blobType });
+                const filename = pickAudioFilename(audioBlob);
+                await sendAudioToMac(audioBlob, filename);
+                stream.getTracks().forEach(t => t.stop());
+            };
+
+            recordingStartedAt = Date.now();
+            mediaRecorder.start(250);
+            isRecording = true;
+
+            micBtn.classList.add("listening");
+            setStatus("Listening...", "listening");
+            twTranscriptId++;
+            twResponseId++;
+            transcriptEl.style.display = "none";
+            responseEl.style.display = "none";
+            transcriptEl.classList.remove("typing");
+            responseEl.classList.remove("typing");
+        }
+
+        function pickAudioFilename(blob) {
+            const t = (blob.type || "").toLowerCase();
+            if (t.includes("mp4") || t.includes("aac") || t.includes("mpeg") || t.includes("m4a")) {
+                return "command.m4a";
+            }
+            if (t.includes("webm")) {
+                return "command.webm";
+            }
+            return "command.m4a";
+        }
+
+        function clearMinDurationTimer() {
+            if (minDurationTimer) {
+                clearTimeout(minDurationTimer);
+                minDurationTimer = null;
+            }
+        }
+
+        function stopRecording() {
+            if (!isRecording || !mediaRecorder) return;
+            if (mediaRecorder.state === "inactive") return;
+
+            const elapsed = Date.now() - recordingStartedAt;
+            const need = MIN_RECORDING_MS - elapsed;
+
+            if (need > 0) {
+                micBtn.classList.remove("listening");
+                micBtn.classList.add("processing");
+                setStatus("Finishing capture…", "processing");
+                clearMinDurationTimer();
+                minDurationTimer = setTimeout(() => {
+                    minDurationTimer = null;
+                    finalizeStop();
+                }, need);
+                return;
+            }
+
+            finalizeStop();
+        }
+
+        function finalizeStop() {
+            if (!mediaRecorder || mediaRecorder.state === "inactive") {
+                isRecording = false;
+                return;
+            }
+            try {
+                if (mediaRecorder.state === "recording" && typeof mediaRecorder.requestData === "function") {
+                    mediaRecorder.requestData();
+                }
+            } catch (e) { /* ignore */ }
+            mediaRecorder.stop();
+            isRecording = false;
+            micBtn.classList.remove("listening");
+            micBtn.classList.add("processing");
+            setStatus("Processing...", "processing");
+        }
+
+        async function sendAudioToMac(audioBlob, filename) {
+            try {
+                if (!audioBlob || audioBlob.size < MIN_AUDIO_BYTES) {
+                    micBtn.classList.remove("processing");
+                    const msg = "No audio captured — hold 2+ seconds, speak, then release.";
+                    setStatus(msg, "error");
+                    reveal(transcriptEl, msg, { className: "transcript bad" }, {});
+                    setTimeout(() => setStatus("Mac is connected ✓", "connected"), 3500);
+                    return;
+                }
+
+                const formData = new FormData();
+                formData.append("audio", audioBlob, filename);
+
+                const res = await fetch(`${SERVER_URL}/voice-command`, {
+                    method: "POST",
+                    body: formData
+                });
+
+                const data = await res.json();
+
+                if (!res.ok) {
+                    throw new Error(data.detail || data.error || "Request failed");
+                }
+
+                function updateFileContentDisplay(d) {
+                    const contentBox = document.getElementById("fileContent");
+                    const filenameEl = document.getElementById("filename");
+                    const truncatedNote = document.getElementById("truncatedNote");
+                    if (!contentBox) return;
+                    if (d.content && d.content.length > 0) {
+                        contentBox.textContent = d.content;
+                        contentBox.style.display = "block";
+                        if (filenameEl) {
+                            if (d.filename) {
+                                filenameEl.textContent =
+                                    `📄 ${d.filename} (${d.word_count || 0} words)`;
+                                filenameEl.style.display = "block";
+                            } else {
+                                filenameEl.style.display = "none";
+                            }
+                        }
+                        if (truncatedNote) {
+                            truncatedNote.style.display = d.truncated ? "block" : "none";
+                        }
+                    } else {
+                        contentBox.style.display = "none";
+                        if (filenameEl) filenameEl.style.display = "none";
+                        if (truncatedNote) truncatedNote.style.display = "none";
+                    }
+                }
+
+                updateFileContentDisplay(data);
+
+                function showResponseBlock() {
+                    responseEl.className = "response";
+
+                    if (data.osascript_ok === false && data.osascript_error) {
+                        let msg = `Mac did not run the command.\n${data.osascript_error}`;
+                        if (data.hint) msg += `\n\n${data.hint}`;
+                        reveal(responseEl, msg, {
+                            className: "response fail",
+                            msPerChar: msPerCharFor(msg),
+                        }, data);
+                    } else if (data.action) {
+                        let line = `✓ ${data.action}`;
+                        if (data.detail) line += `\n${data.detail}`;
+                        reveal(responseEl, line, {
+                            className: "response",
+                            msPerChar: msPerCharFor(line),
+                        }, data);
+                    } else {
+                        responseEl.style.display = "none";
+                        responseEl.textContent = "";
+                    }
+                }
+
+                if (data.transcript) {
+                    const heard = `"${data.transcript}"`;
+                    reveal(transcriptEl, heard, {
+                        className: "transcript",
+                        msPerChar: msPerCharFor(heard),
+                        onDone: showResponseBlock,
+                    }, data);
+                } else {
+                    showResponseBlock();
+                }
+
+                if (data.error && !data.transcript) {
+                    reveal(transcriptEl, data.error, {
+                        className: "transcript",
+                    }, data);
+                }
+
+                micBtn.classList.remove("processing");
+                setStatus("Mac is connected ✓", "connected");
+
+            } catch (err) {
+                micBtn.classList.remove("processing");
+                setStatus("Error — try again", "error");
+                const msg = (err && err.message) ? String(err.message) : "Request failed";
+                reveal(transcriptEl, msg, { className: "transcript bad" }, {});
+                setTimeout(() => setStatus("Mac is connected ✓", "connected"), 2000);
+            }
+        }
+
+        micBtn.addEventListener("mousedown", startRecording);
+        micBtn.addEventListener("mouseup", stopRecording);
+        micBtn.addEventListener("mouseleave", () => {
+            if (isRecording) stopRecording();
+        });
+        micBtn.addEventListener("touchstart", (e) => {
+            e.preventDefault();
+            startRecording();
+        }, { passive: false });
+        micBtn.addEventListener("touchend", (e) => {
+            e.preventDefault();
+            stopRecording();
+        }, { passive: false });
+
+        checkConnection();
+    </script>
+</body>
+</html>
