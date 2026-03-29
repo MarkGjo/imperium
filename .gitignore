@@ -1,6 +1,6 @@
 # Python
 __pycache__/
-*.py[cod]
+*.py[codz]
 *$py.class
 *.so
 .Python
@@ -16,6 +16,7 @@ build/
 .env
 .env.*
 !.env.example
+.envrc
 
 # IDE / OS
 .idea/
@@ -33,6 +34,12 @@ temp/
 htmlcov/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.tox/
 
 # Frontend / Node (if added later)
 node_modules/
+
+# Cursor
+.cursorignore
+.cursorindexingignore
