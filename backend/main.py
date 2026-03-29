@@ -1,9 +1,10 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import os
 import re
 import subprocess
-import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -11,7 +12,7 @@ import anthropic
 import httpx
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
@@ -168,7 +169,6 @@ app.add_middleware(
 )
 
 claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-ELEVENLABS_KEY = os.getenv("ELEVENLABS_API_KEY")
 
 
 @app.get("/")
@@ -184,88 +184,6 @@ async def favicon():
 @app.get("/meta.json")
 async def meta_json():
     return Response(status_code=204)
-
-
-def _extract_transcript_text(result: dict) -> str:
-    if not result:
-        return ""
-    text = result.get("text")
-    if isinstance(text, str) and text.strip():
-        return text.strip()
-    transcripts = result.get("transcripts")
-    if isinstance(transcripts, list) and transcripts:
-        t0 = transcripts[0]
-        if isinstance(t0, dict):
-            inner = t0.get("text")
-            if isinstance(inner, str) and inner.strip():
-                return inner.strip()
-    return ""
-
-
-def _sniff_audio_mime(audio_bytes: bytes) -> str | None:
-    if len(audio_bytes) >= 12 and audio_bytes[4:8] == b"ftyp":
-        return "audio/mp4"
-    if len(audio_bytes) >= 4 and audio_bytes[0] == 0x1A and audio_bytes[1] == 0x45:
-        return "audio/webm"
-    if len(audio_bytes) >= 3 and audio_bytes[0:3] == b"ID3":
-        return "audio/mpeg"
-    return None
-
-
-async def transcribe_audio(
-    audio_bytes: bytes, filename: str, content_type: str | None = None
-) -> str:
-    if not ELEVENLABS_KEY:
-        raise RuntimeError("ELEVENLABS_API_KEY is not set")
-
-    lower = filename.lower()
-    ctype = "audio/webm"
-    if lower.endswith(".m4a") or lower.endswith(".mp4") or lower.endswith(".aac"):
-        ctype = "audio/mp4"
-    if content_type:
-        ct = content_type.split(";")[0].strip().lower()
-        if ct in ("audio/mp4", "audio/m4a", "audio/aac", "audio/x-m4a"):
-            ctype = "audio/mp4"
-        elif ct == "audio/webm":
-            ctype = "audio/webm"
-    sniffed = _sniff_audio_mime(audio_bytes)
-    if sniffed:
-        ctype = sniffed
-
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://api.elevenlabs.io/v1/speech-to-text",
-            headers={"xi-api-key": ELEVENLABS_KEY},
-            files={"file": (filename, audio_bytes, ctype)},
-            data={"model_id": "scribe_v1"},
-            timeout=60.0,
-        )
-        try:
-            result = response.json()
-        except json.JSONDecodeError:
-            response.raise_for_status()
-            return ""
-        if response.status_code >= 400:
-            if result.get("status") == "audio_too_short" or result.get("code") == "audio_too_short":
-                raise RuntimeError(
-                    "Recording too short for ElevenLabs — hold the mic at least 1–2 seconds, then release."
-                )
-            msg_l = str(result.get("message") or "").lower()
-            if (
-                result.get("code") == "empty_file"
-                or result.get("status") == "empty_file"
-                or ("empty" in msg_l and "file" in msg_l)
-            ):
-                raise RuntimeError(
-                    "Recording was empty or unreadable — hold the mic 2+ seconds, speak clearly, then release."
-                )
-            if result.get("code") == "invalid_audio":
-                raise RuntimeError(
-                    "Audio format issue — try again; if on iPhone, update the page and record again."
-                )
-            detail = result.get("detail") or result.get("message") or str(result)
-            raise RuntimeError(f"ElevenLabs STT failed ({response.status_code}): {detail}")
-        return _extract_transcript_text(result)
 
 
 def _with_shortcuts(d: dict, found: dict[str, str]) -> dict:
@@ -380,51 +298,6 @@ def _extract_spotify_play_query(transcript: str) -> str:
     if m:
         return m.group(1).strip().rstrip(".!?")
     return ""
-
-
-async def speak_text(text: str) -> bool:
-    """
-    Sends text to ElevenLabs TTS and plays it on the Mac.
-    Used to speak file contents back to the user.
-    """
-    if not ELEVENLABS_KEY or not text or not text.strip():
-        return False
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM",
-                headers={
-                    "xi-api-key": ELEVENLABS_KEY,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "text": text[:2000],
-                    "model_id": "eleven_monolingual_v1",
-                    "voice_settings": {
-                        "stability": 0.5,
-                        "similarity_boost": 0.75,
-                    },
-                },
-                timeout=30.0,
-            )
-
-            if response.status_code != 200:
-                return False
-
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-                tmp.write(response.content)
-                tmp_path = tmp.name
-
-            subprocess.run(
-                ["afplay", tmp_path],
-                check=True,
-            )
-            os.unlink(tmp_path)
-            return True
-
-    except Exception as e:
-        print(f"TTS error: {e}")
-        return False
 
 
 _SIMPLE_OPEN_INTENT = re.compile(
@@ -611,7 +484,6 @@ def _parse_json_from_claude(text: str) -> dict:
 
 
 def get_applescript(command: str, shortcut_context: str = "") -> tuple[str, str]:
-    # Fast model for JSON+AppleScript; override with ANTHROPIC_SCRIPT_MODEL if needed.
     script_model = os.getenv(
         "ANTHROPIC_SCRIPT_MODEL", "claude-haiku-4-5"
     ).strip()
@@ -695,6 +567,21 @@ EMAIL RULES:
 - Always set subject, body, recipient before sending
 - Call send at the end
 - If no recipient given use placeholder and say so in action
+
+EMAIL WITH ATTACHMENT — use this EXACT template:
+tell application "Mail"
+    set theMessage to make new outgoing message with properties {{subject:"SUBJECT_HERE", content:"BODY_HERE", visible:true}}
+    tell theMessage
+        make new to recipient at end of to recipients with properties {{address:"EMAIL_HERE"}}
+        make new attachment with properties {{file name:POSIX file "/Users/jasmansidhu/Desktop/FILENAME_HERE"}} at after the last paragraph
+    end tell
+    activate
+end tell
+- Replace SUBJECT_HERE, BODY_HERE, EMAIL_HERE, FILENAME_HERE with actual values
+- For files on Desktop, use: /Users/jasmansidhu/Desktop/filename.ext
+- For files in Downloads, use: /Users/jasmansidhu/Downloads/filename.ext
+- For files in Documents, use: /Users/jasmansidhu/Documents/filename.ext
+- Always include the file extension (.txt, .pdf, .rtf, etc.)
 
 FILE & FOLDER (Finder): use path to desktop folder / Finder objects — avoid broken POSIX folder paths with trailing slashes (Finder -1728).
 
@@ -915,533 +802,23 @@ def run_applescript(script: str, original_action: str = "") -> tuple[dict, str]:
     return _osascript_pipe(script), original_action
 
 
-@app.post("/voice-command")
-async def voice_command(audio: UploadFile = File(...)):
-    audio_bytes = await audio.read()
-    filename = audio.filename or "audio.webm"
-
-    if len(audio_bytes) < 400:
-        return {
-            "error": "Audio was empty or too small — hold the mic 2+ seconds, speak, then release.",
-        }
-
+@app.post("/text-command")
+async def text_command(data: dict):
+    command = data.get("command", "")
+    if not command.strip():
+        return {"error": "No command provided"}
     try:
-        transcript = await transcribe_audio(
-            audio_bytes, filename, content_type=audio.content_type
-        )
+        script, action = get_applescript(command)
     except Exception as e:
-        return {"error": str(e)}
-
-    transcript = clean_transcript(transcript)
-    print(f"Heard: {transcript}")
-
-    if not transcript:
-        return {"error": "Could not understand audio"}
-
-    _, found_shortcuts = resolve_shortcuts(transcript)
-    shortcut_context = build_shortcut_context(found_shortcuts)
-
-    # ── Atomic workflows (full transcript — before parse_command / step splitting) ──
-    from gmail_handler import (
-        extract_gmail_fields,
-        run_gmail_compose_atomic,
-        transcript_wants_gmail_compose,
-    )
-
-    if transcript_wants_gmail_compose(transcript):
-        gf = extract_gmail_fields(transcript)
-        if gf.get("to"):
-            print("Handled via: atomic — gmail_handler (Playwright)")
-            gout = await run_gmail_compose_atomic(transcript)
-            return _with_shortcuts(gout, found_shortcuts)
-
-    claude_prompt_check_early = _transcript_wants_claude_prompt(transcript)
-    is_claude_prompt_early, extracted_prompt_early = claude_prompt_check_early
-    if is_claude_prompt_early:
-        if not extracted_prompt_early:
-            ok, err = open_url_in_chrome("https://claude.ai")
-            print(
-                "Handled via: atomic — playwright_claude_fallback "
-                "(opened Claude.ai; prompt text not extracted)"
-            )
-            return _with_shortcuts(
-                {
-                    "transcript": transcript,
-                    "action": (
-                        "Opened Claude.ai — could not extract prompt text, "
-                        "please type manually"
-                    ),
-                    "method": "playwright_claude_fallback",
-                    "osascript_ok": ok,
-                    "result": "",
-                    "error": None if ok else err,
-                },
-                found_shortcuts,
-            )
-        if not PLAYWRIGHT_AVAILABLE:
-            return _with_shortcuts(
-                {
-                    "transcript": transcript,
-                    "error": (
-                        "Install Playwright: pip install playwright && "
-                        "playwright install chrome"
-                    ),
-                    "osascript_ok": False,
-                },
-                found_shortcuts,
-            )
-        if not playwright_enabled():
-            return _with_shortcuts(
-                {
-                    "transcript": transcript,
-                    "error": (
-                        "Claude prompt automation needs Playwright. "
-                        "Set USE_PLAYWRIGHT=1 in .env"
-                    ),
-                    "osascript_ok": False,
-                },
-                found_shortcuts,
-            )
-        from playwright_claude import send_prompt_to_claude
-
-        ok, action_msg = await send_prompt_to_claude(extracted_prompt_early)
-        print("Handled via: atomic — playwright_claude (Claude prompt)")
-        return _with_shortcuts(
-            {
-                "transcript": transcript,
-                "action": action_msg if ok else "Claude prompt automation failed",
-                "method": "playwright_claude",
-                "osascript_ok": ok,
-                "success": ok,
-                "result": "",
-                "error": None if ok else action_msg,
-            },
-            found_shortcuts,
-        )
-
-    if _transcript_wants_file_read(transcript):
-        from file_reader import handle_file_read
-
-        file_result = await handle_file_read(transcript)
-
-        if file_result.get("success") and file_result.get("voice_content"):
-            await speak_text(file_result["voice_content"])
-        elif file_result.get("success") and file_result.get("content"):
-            await speak_text(file_result["content"][:2000])
-
-        print("Handled via: atomic — file_reader (Downloads)")
-        return _with_shortcuts(
-            {
-                "transcript": transcript,
-                "action": file_result["action"],
-                "method": file_result["method"],
-                "success": file_result.get("success", False),
-                "content": file_result.get("content", ""),
-                "filename": file_result.get("filename", ""),
-                "word_count": file_result.get("word_count", 0),
-                "truncated": file_result.get("truncated", False),
-                "error": file_result.get("error"),
-            },
-            found_shortcuts,
-        )
-
-    if _transcript_wants_atomic_spotify_play(transcript):
-        from command_parser import CommandStep
-        from step_executor import execute_spotify_play
-
-        sp_content = _extract_spotify_play_query(transcript)
-        if sp_content:
-            print("Handled via: atomic — Spotify play (single flow)")
-            sp_step = CommandStep(
-                action="play",
-                target="spotify",
-                content=sp_content,
-                raw=transcript,
-                index=0,
-            )
-            sp_result = await execute_spotify_play(sp_step)
-            sp_result["transcript"] = transcript
-            return _with_shortcuts(sp_result, found_shortcuts)
-
-    from command_parser import parse_command
-    from step_executor import execute_steps
-
-    print(f"\n{'='*60}")
-    print(f"TRANSCRIPT: {transcript}")
-    print(f"SHORTCUTS: {found_shortcuts}")
-    print("PARSING INTO STEPS...")
-    steps = parse_command(transcript)
-    print(f"FOUND {len(steps)} STEP(S)")
-    print(f"{'='*60}\n")
-
-    if len(steps) > 1:
-        result = await execute_steps(
-            steps,
-            found_shortcuts,
-            shortcut_context,
-            get_applescript,
-            run_applescript,
-        )
-        print("Handled via: multi-step (command_parser + step_executor)")
-        err_msg = (
-            "; ".join(result["errors"])
-            if result.get("errors")
-            else None
-        )
-        return _with_shortcuts(
-            {
-                "transcript": transcript,
-                "action": result.get("action", ""),
-                "method": result.get("method", "multi_step"),
-                "errors": result.get("errors"),
-                "steps_completed": result.get("steps_completed", 0),
-                "steps_total": result.get("steps_total", len(steps)),
-                "steps_parsed": len(steps),
-                "osascript_ok": result.get("osascript_ok", True),
-                "result": "",
-                "error": err_msg,
-                "success": result.get("osascript_ok", False),
-            },
-            found_shortcuts,
-        )
-
-    if transcript_wants_claude_upload_flow(transcript):
-        if not PLAYWRIGHT_AVAILABLE:
-            return _with_shortcuts(
-                {
-                    "transcript": transcript,
-                    "error": "Install Playwright: pip install playwright && playwright install chrome",
-                    "osascript_ok": False,
-                },
-                found_shortcuts,
-            )
-        if not playwright_enabled():
-            return _with_shortcuts(
-                {
-                    "transcript": transcript,
-                    "error": "Claude upload automation needs Playwright. Set USE_PLAYWRIGHT=1 in .env",
-                    "osascript_ok": False,
-                },
-                found_shortcuts,
-            )
-        pw = await run_claude_upload_playwright(transcript)
-        if pw.get("method") == "playwright_claude":
-            print("Handled via: Playwright (Claude upload + prompt)")
-            return _with_shortcuts(pw, found_shortcuts)
-        if pw.get("error"):
-            return _with_shortcuts(
-                {
-                    "transcript": transcript,
-                    "error": pw["error"],
-                    "hint": (
-                        "Ensure ~/Downloads has the PDF, you’re logged into claude.ai in the opened window, "
-                        "or set CLAUDE_PLAYWRIGHT_USER_DATA_DIR to persist login. "
-                        "Official chat URL is https://claude.ai (not claude.com)."
-                    ),
-                    "osascript_ok": False,
-                },
-                found_shortcuts,
-            )
-
-    if transcript_wants_youtube_dom_control(transcript):
-        if not PLAYWRIGHT_AVAILABLE:
-            return _with_shortcuts(
-                {
-                    "transcript": transcript,
-                    "error": "Install Playwright: pip install playwright && playwright install chromium",
-                    "osascript_ok": False,
-                },
-                found_shortcuts,
-            )
-        if not playwright_enabled():
-            return _with_shortcuts(
-                {
-                    "transcript": transcript,
-                    "error": "Browser clicks need Playwright enabled. Set USE_PLAYWRIGHT=1 in .env",
-                    "osascript_ok": False,
-                },
-                found_shortcuts,
-            )
-
-    if playwright_enabled() and transcript_wants_youtube_dom_control(transcript):
-        pw = await run_youtube_playwright(transcript)
-        if pw.get("method") == "playwright":
-            print("Handled via: Playwright (DOM)")
-            return _with_shortcuts(pw, found_shortcuts)
-        if pw.get("error"):
-            # Do not fall through to Claude (~30–60s) for click intents — wrong tool.
-            return _with_shortcuts(
-                {
-                    "transcript": transcript,
-                    "error": pw["error"],
-                    "hint": "Run: playwright install chromium (or fix the error above). For URL-only, say: open youtube.com in Chrome.",
-                    "osascript_ok": False,
-                },
-                found_shortcuts,
-            )
-
-    compound = parse_compound_command(transcript)
-    is_compound = bool(compound.get("is_compound"))
-
-    if not wants_vscode_html_create(transcript) and not wants_vscode_python_create(
-        transcript
-    ):
-        if is_compound:
-            app_name = compound["app_name"]
-            sec_action = compound["secondary_action"]
-            sec_type = compound["secondary_type"]
-            fb = lookup_fallback_url(app_name, found_shortcuts)
-            method, app_action, script_or_path = resolve_app_or_web(app_name, fb)
-
-            if method != "not_found":
-                spotify_fb1: str | None = None
-                spotify_fb2: str | None = None
-                spotify_human: str | None = None
-                if "spotify" in app_name.lower() and method == "native_app":
-                    bundle = await build_spotify_in_app_bundle(sec_action)
-                    if bundle:
-                        in_app, spotify_fb1, spotify_fb2, spotify_human = bundle
-                    else:
-                        in_app = None
-                else:
-                    in_app = await build_in_app_action_script(
-                        app_name,
-                        sec_action,
-                        sec_type,
-                        spotify_use_native=(method == "native_app"),
-                    )
-
-                if (
-                    in_app
-                    and method == "chrome_tab"
-                    and (
-                        "youtube" in app_name.lower()
-                        or "spotify" in app_name.lower()
-                    )
-                ):
-                    print(
-                        "Handled via: native_app_compound (web search tab; "
-                        "skipping homepage)"
-                    )
-                    ex = _osascript_pipe(in_app)
-                    return _with_shortcuts(
-                        {
-                            "transcript": transcript,
-                            "action": f"{app_action} → {sec_action}",
-                            "method": "native_app_compound",
-                            "osascript_ok": ex["returncode"] == 0,
-                            "result": (ex["stdout"] or "").strip(),
-                            "error": ex["stderr"] if ex["returncode"] != 0 else None,
-                        },
-                        found_shortcuts,
-                    )
-
-                if in_app is None:
-                    try:
-                        print("Compound: falling back to Claude AppleScript")
-                        full_script, claude_action = get_applescript(
-                            transcript, shortcut_context
-                        )
-                        exec_result, action_out = run_applescript(
-                            full_script, claude_action
-                        )
-                        return _with_shortcuts(
-                            {
-                                "transcript": transcript,
-                                "action": action_out,
-                                "method": "applescript_compound",
-                                "osascript_ok": exec_result["returncode"] == 0,
-                                "result": exec_result["stdout"],
-                                "error": exec_result["stderr"]
-                                if exec_result["returncode"] != 0
-                                else None,
-                            },
-                            found_shortcuts,
-                        )
-                    except Exception as e:
-                        print(f"Compound AppleScript fallback failed: {e}")
-
-                elif in_app is not None:
-                    results: list[str] = []
-                    if method == "native_app":
-                        print("Handled via: native_app_compound (native + in-app)")
-                        ok, msg = open_native_app(script_or_path)
-                        results.append(msg)
-                        if not ok:
-                            return _with_shortcuts(
-                                {
-                                    "transcript": transcript,
-                                    "action": msg,
-                                    "method": "native_app_compound",
-                                    "osascript_ok": False,
-                                    "error": msg,
-                                    "result": "",
-                                },
-                                found_shortcuts,
-                            )
-                    elif method == "chrome_tab":
-                        print("Handled via: native_app_compound (Chrome base + in-app)")
-                        ex0 = _osascript_pipe(script_or_path)
-                        results.append(
-                            app_action
-                            if ex0["returncode"] == 0
-                            else (ex0["stderr"] or "Chrome step failed")
-                        )
-                        if ex0["returncode"] != 0:
-                            return _with_shortcuts(
-                                {
-                                    "transcript": transcript,
-                                    "action": results[0],
-                                    "method": "native_app_compound",
-                                    "osascript_ok": False,
-                                    "error": ex0["stderr"],
-                                    "result": "",
-                                },
-                                found_shortcuts,
-                            )
-
-                    await asyncio.sleep(2.5)
-                    ex2 = _osascript_pipe(in_app)
-                    if ex2["returncode"] != 0 and spotify_fb1:
-                        print(
-                            "Spotify play track failed; trying keyboard fallback 1"
-                        )
-                        ex2 = _osascript_pipe(spotify_fb1)
-                    if ex2["returncode"] != 0 and spotify_fb2:
-                        print(
-                            "Spotify keyboard fallback 1 failed; trying fallback 2"
-                        )
-                        ex2 = _osascript_pipe(spotify_fb2)
-                    if ex2["returncode"] == 0:
-                        if spotify_human:
-                            results.append(spotify_human)
-                        else:
-                            results.append(f"Then: {sec_action}")
-                        combined_action = " → ".join(results)
-                    else:
-                        combined_action = (
-                            results[0] + f" (could not automate: {sec_action})"
-                        )
-                    return _with_shortcuts(
-                        {
-                            "transcript": transcript,
-                            "action": combined_action,
-                            "method": "native_app_compound",
-                            "osascript_ok": ex2["returncode"] == 0,
-                            "result": (ex2["stdout"] or "").strip(),
-                            "error": ex2["stderr"] if ex2["returncode"] != 0 else None,
-                        },
-                        found_shortcuts,
-                    )
-
-    wants_app, spoken_app_name = _transcript_wants_app_open(transcript)
-    if (
-        wants_app
-        and spoken_app_name
-        and not is_compound
-        and not wants_vscode_html_create(transcript)
-        and not wants_vscode_python_create(transcript)
-    ):
-        fb = lookup_fallback_url(spoken_app_name, found_shortcuts)
-        method, app_action, script_or_path = resolve_app_or_web(spoken_app_name, fb)
-        if method == "native_app":
-            print("Handled via: native app launcher")
-            ok, msg = open_native_app(script_or_path)
-            return _with_shortcuts(
-                {
-                    "transcript": transcript,
-                    "action": msg,
-                    "method": "native_app",
-                    "osascript_ok": ok,
-                    "result": script_or_path if ok else "",
-                    "error": None if ok else msg,
-                },
-                found_shortcuts,
-            )
-        if method == "chrome_tab":
-            print("Handled via: native app fallback → Chrome tab")
-            ex = _osascript_pipe(script_or_path)
-            return _with_shortcuts(
-                {
-                    "transcript": transcript,
-                    "action": app_action,
-                    "method": "chrome_tab",
-                    "osascript_ok": ex["returncode"] == 0,
-                    "result": (ex["stdout"] or "").strip(),
-                    "error": ex["stderr"] if ex["returncode"] != 0 else None,
-                },
-                found_shortcuts,
-            )
-        # not_found: no .app and no shortcut URL — continue to Chrome CLI / AppleScript
-
-    quick = await attempt_chrome_open_cli(transcript, found_shortcuts)
-    if quick:
-        print("Handled via: Chrome new-tab (CLI)")
-        return _with_shortcuts(quick, found_shortcuts)
-
-    if wants_vscode_html_create(transcript):
-        try:
-            print("Handled via: HTML on Desktop + VS Code + browser")
-            out = create_vscode_html_file(transcript, shortcut_context)
-            out["transcript"] = transcript
-            return _with_shortcuts(out, found_shortcuts)
-        except Exception as e:
-            print(f"VS Code / HTML file path failed ({e}), falling back to AppleScript")
-
-    if wants_vscode_python_create(transcript):
-        try:
-            print("Handled via: Python file on Desktop + VS Code")
-            out = create_vscode_python_file(transcript, shortcut_context)
-            out["transcript"] = transcript
-            return _with_shortcuts(out, found_shortcuts)
-        except Exception as e:
-            print(f"VS Code / Python file path failed ({e}), falling back to AppleScript")
-
-    if wants_notes_compose_with_text(transcript):
-        body = resolve_notes_body(transcript)
-        if body:
-            print("Handled via: Notes (pbcopy + paste)")
-            out = run_notes_new_note_and_paste(body, transcript)
-            out["transcript"] = transcript
-            return _with_shortcuts(out, found_shortcuts)
-
-    try:
-        script, action = get_applescript(transcript, shortcut_context)
-    except Exception as e:
-        return _with_shortcuts(
-            {"transcript": transcript, "error": f"Claude: {e}"},
-            found_shortcuts,
-        )
-
-    print(f"Action: {action}")
-    print(f"Script: {script}")
-
-    exec_result, action_out = run_applescript(script, action)
-    action = action_out
-    if exec_result["returncode"] != 0:
-        print(f"osascript stderr: {exec_result['stderr']}")
-        fallback = await attempt_chrome_open_cli(transcript, found_shortcuts)
-        if fallback:
-            print("AppleScript failed; succeeded via Chrome new-tab (CLI)")
-            return _with_shortcuts(fallback, found_shortcuts)
-
-    payload: dict = {
-        "transcript": transcript,
+        return {"transcript": command, "error": f"Claude: {e}"}
+    result, _ = run_applescript(script, action)
+    return {
+        "transcript": command,
         "action": action,
-        "result": exec_result["stdout"],
-        "osascript_ok": exec_result["returncode"] == 0,
-        "method": "applescript",
+        "result": result["stdout"],
+        "osascript_ok": result["returncode"] == 0,
+        "osascript_error": result.get("stderr", "")
     }
-    if exec_result["returncode"] != 0:
-        err = exec_result["stderr"] or "AppleScript failed (no details)"
-        payload["osascript_error"] = err
-        hint = (
-            " On Mac: System Settings → Privacy & Security → Accessibility — add Terminal "
-            "(or the app running Python). Automation: allow controlling Google Chrome."
-        )
-        if "Not authorized" in err or "-1743" in err or "not allowed" in err.lower():
-            payload["hint"] = hint.strip()
-    return _with_shortcuts(payload, found_shortcuts)
 
 
 app.mount(
@@ -1452,7 +829,6 @@ app.mount(
 
 
 if __name__ == "__main__":
-    # Auto-reload on .py changes (no manual restart). Set UVICORN_RELOAD=0 to disable.
     _port = int(os.getenv("PORT", "8000"))
     _host = os.getenv("UVICORN_HOST", "0.0.0.0").strip()
     _reload = os.getenv("UVICORN_RELOAD", "1").strip().lower() not in (

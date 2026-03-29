@@ -37,7 +37,6 @@ _UNDEFINED_CHECKS: list[tuple[str, str]] = [
     (r"\bemailAddress\b", "emailAddress"),
     (r"\bmessageBody\b", "messageBody"),
     (r"\bmailBody\b", "mailBody"),
-    (r"\btheMessage\b", "theMessage"),
 ]
 
 
