@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mac Control</title>
+    <title>Imperium</title>
     <style>
         * {
             margin: 0;
@@ -56,6 +56,20 @@
             gap: 12px;
         }
 
+        .message-wrapper {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .message-wrapper.user-wrapper {
+            align-items: flex-end;
+        }
+
+        .message-wrapper.response-wrapper {
+            align-items: flex-start;
+        }
+
         .message {
             padding: 12px 16px;
             border-radius: 16px;
@@ -67,21 +81,18 @@
         .message.user {
             background: #1c1c1e;
             color: #fff;
-            align-self: flex-end;
             border-bottom-right-radius: 4px;
         }
 
         .message.success {
             background: #0d3320;
             color: #30d158;
-            align-self: flex-start;
             border-bottom-left-radius: 4px;
         }
 
         .message.error {
             background: #3a1a1a;
             color: #ff453a;
-            align-self: flex-start;
             border-bottom-left-radius: 4px;
             white-space: pre-wrap;
         }
@@ -89,8 +100,42 @@
         .message.processing {
             background: #1c1c1e;
             color: #ffd60a;
-            align-self: flex-start;
             border-bottom-left-radius: 4px;
+        }
+
+        .message-actions {
+            display: flex;
+            gap: 8px;
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+
+        .message-wrapper:hover .message-actions {
+            opacity: 1;
+        }
+
+        .action-btn {
+            background: none;
+            border: none;
+            color: #666;
+            font-size: 11px;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .action-btn:hover {
+            background: #1c1c1e;
+            color: #fff;
+        }
+
+        .action-btn svg {
+            width: 12px;
+            height: 12px;
+            fill: currentColor;
         }
 
         .input-area {
@@ -169,6 +214,17 @@
             font-size: 14px;
             max-width: 280px;
         }
+
+        .editing-hint {
+            font-size: 11px;
+            color: #ffd60a;
+            margin-bottom: 4px;
+            display: none;
+        }
+
+        .editing-hint.show {
+            display: block;
+        }
     </style>
 </head>
 <body>
@@ -181,19 +237,22 @@
     <div class="feed" id="feed">
         <div class="empty-state" id="emptyState">
             <div class="icon">💻</div>
-            <div class="hint">Type a command to control your Mac. Try "open Safari" or "set volume to 50"</div>
+            <div class="hint">Type a command to control your Mac. Try "open Safari" or "create a calculator app"</div>
         </div>
     </div>
 
     <div class="input-area">
-        <input 
-            type="text" 
-            class="text-input" 
-            id="commandInput" 
-            placeholder="Text your Mac..."
-            autocomplete="off"
-            autocapitalize="off"
-        >
+        <div style="flex: 1; display: flex; flex-direction: column;">
+            <div class="editing-hint" id="editingHint">Editing message — press Enter to send</div>
+            <input 
+                type="text" 
+                class="text-input" 
+                id="commandInput" 
+                placeholder="Text your Mac..."
+                autocomplete="off"
+                autocapitalize="off"
+            >
+        </div>
         <button class="send-btn" id="sendBtn" disabled>
             <svg viewBox="0 0 24 24">
                 <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
@@ -209,8 +268,10 @@
         const statusEl = document.getElementById("status");
         const inputEl = document.getElementById("commandInput");
         const sendBtn = document.getElementById("sendBtn");
+        const editingHint = document.getElementById("editingHint");
 
         let isProcessing = false;
+        let editingWrapper = null;
 
         function setStatus(msg, type = "") {
             statusEl.textContent = msg;
@@ -232,16 +293,100 @@
             }
         }
 
-        function addMessage(text, type) {
+        function createUserMessage(text) {
             if (emptyStateEl) {
                 emptyStateEl.style.display = "none";
             }
+
+            const wrapper = document.createElement("div");
+            wrapper.className = "message-wrapper user-wrapper";
+            wrapper.dataset.command = text;
+
+            const msg = document.createElement("div");
+            msg.className = "message user";
+            msg.textContent = text;
+
+            const actions = document.createElement("div");
+            actions.className = "message-actions";
+
+            const editBtn = document.createElement("button");
+            editBtn.className = "action-btn";
+            editBtn.innerHTML = `
+                <svg viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
+                Edit
+            `;
+            editBtn.onclick = () => startEdit(wrapper);
+
+            const retryBtn = document.createElement("button");
+            retryBtn.className = "action-btn";
+            retryBtn.innerHTML = `
+                <svg viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+                Retry
+            `;
+            retryBtn.onclick = () => retryCommand(wrapper);
+
+            actions.appendChild(editBtn);
+            actions.appendChild(retryBtn);
+
+            wrapper.appendChild(msg);
+            wrapper.appendChild(actions);
+            feedEl.appendChild(wrapper);
+            feedEl.scrollTop = feedEl.scrollHeight;
+
+            return wrapper;
+        }
+
+        function addResponse(text, type, userWrapper) {
+            const wrapper = document.createElement("div");
+            wrapper.className = "message-wrapper response-wrapper";
+            if (userWrapper) {
+                wrapper.dataset.userWrapper = "linked";
+                userWrapper.linkedResponse = wrapper;
+            }
+
             const msg = document.createElement("div");
             msg.className = `message ${type}`;
             msg.textContent = text;
-            feedEl.appendChild(msg);
+
+            wrapper.appendChild(msg);
+            feedEl.appendChild(wrapper);
             feedEl.scrollTop = feedEl.scrollHeight;
-            return msg;
+
+            return wrapper;
+        }
+
+        function startEdit(wrapper) {
+            if (isProcessing) return;
+            
+            const command = wrapper.dataset.command;
+            inputEl.value = command;
+            editingWrapper = wrapper;
+            editingHint.classList.add("show");
+            inputEl.focus();
+            inputEl.select();
+            updateSendButton();
+        }
+
+        function retryCommand(wrapper) {
+            if (isProcessing) return;
+            
+            const command = wrapper.dataset.command;
+            
+            // Remove the response if exists
+            if (wrapper.linkedResponse) {
+                wrapper.linkedResponse.remove();
+            }
+            // Remove the user message
+            wrapper.remove();
+            
+            // Send the same command again
+            inputEl.value = command;
+            sendCommand();
+        }
+
+        function cancelEdit() {
+            editingWrapper = null;
+            editingHint.classList.remove("show");
         }
 
         function updateSendButton() {
@@ -252,13 +397,22 @@
             const command = inputEl.value.trim();
             if (!command || isProcessing) return;
 
+            // If editing, remove old message and its response
+            if (editingWrapper) {
+                if (editingWrapper.linkedResponse) {
+                    editingWrapper.linkedResponse.remove();
+                }
+                editingWrapper.remove();
+                cancelEdit();
+            }
+
             isProcessing = true;
             updateSendButton();
             
-            addMessage(command, "user");
+            const userWrapper = createUserMessage(command);
             inputEl.value = "";
             
-            const processingMsg = addMessage("Processing...", "processing");
+            const processingWrapper = addResponse("Processing...", "processing", null);
 
             try {
                 const res = await fetch(`${SERVER_URL}/text-command`, {
@@ -271,25 +425,25 @@
 
                 const data = await res.json();
                 
-                processingMsg.remove();
+                processingWrapper.remove();
 
                 if (data.error) {
-                    addMessage(data.error, "error");
+                    addResponse(data.error, "error", userWrapper);
                 } else if (data.osascript_ok === false) {
                     let errMsg = data.action || "Command failed";
                     if (data.osascript_error) {
                         errMsg += `\n${data.osascript_error}`;
                     }
-                    addMessage(errMsg, "error");
+                    addResponse(errMsg, "error", userWrapper);
                 } else if (data.action) {
-                    addMessage(`✓ ${data.action}`, "success");
+                    addResponse(`✓ ${data.action}`, "success", userWrapper);
                 } else {
-                    addMessage("✓ Command executed", "success");
+                    addResponse("✓ Command executed", "success", userWrapper);
                 }
 
             } catch (err) {
-                processingMsg.remove();
-                addMessage(`Error: ${err.message || "Request failed"}`, "error");
+                processingWrapper.remove();
+                addResponse(`Error: ${err.message || "Request failed"}`, "error", userWrapper);
             }
 
             isProcessing = false;
@@ -297,12 +451,23 @@
             inputEl.focus();
         }
 
-        inputEl.addEventListener("input", updateSendButton);
+        inputEl.addEventListener("input", () => {
+            updateSendButton();
+            // If user clears input while editing, cancel edit mode
+            if (editingWrapper && !inputEl.value.trim()) {
+                cancelEdit();
+            }
+        });
         
         inputEl.addEventListener("keydown", (e) => {
             if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 sendCommand();
+            }
+            if (e.key === "Escape" && editingWrapper) {
+                inputEl.value = "";
+                cancelEdit();
+                updateSendButton();
             }
         });
 

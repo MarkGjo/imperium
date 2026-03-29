@@ -568,6 +568,19 @@ EMAIL RULES:
 - Call send at the end
 - If no recipient given use placeholder and say so in action
 
+iMESSAGE / MESSAGES RULES:
+- To send an iMessage, you MUST use a phone number or email address, NOT a contact name
+- If user says "text [name]" or "message [name]", ask them to provide the phone number in the action response
+- If user provides a phone number, use this EXACT template:
+tell application "Messages"
+    set targetService to 1st account whose service type = iMessage
+    set targetBuddy to participant "+1XXXXXXXXXX" of targetService
+    send "MESSAGE_TEXT_HERE" to targetBuddy
+end tell
+- Replace +1XXXXXXXXXX with the actual phone number (include country code)
+- If no phone number provided, just open Messages app and explain in action that user needs to provide phone number
+- Example: "text 555-123-4567 saying hello" → use participant "+15551234567"
+
 EMAIL WITH ATTACHMENT — use this EXACT template:
 tell application "Mail"
     set theMessage to make new outgoing message with properties {{subject:"SUBJECT_HERE", content:"BODY_HERE", visible:true}}
@@ -607,7 +620,13 @@ Return ONLY this JSON — no markdown, no explanation:
         ],
     )
     raw = message.content[0].text
-    data = _parse_json_from_claude(raw)
+    print(f"CLAUDE RAW RESPONSE:\n{raw[:1000]}{'...' if len(raw) > 1000 else ''}")
+    try:
+        data = _parse_json_from_claude(raw)
+    except json.JSONDecodeError as e:
+        print(f"JSON PARSE ERROR: {e}")
+        print(f"FULL RESPONSE:\n{raw}")
+        raise
     return data["script"], data["action"]
 
 
@@ -802,16 +821,898 @@ def run_applescript(script: str, original_action: str = "") -> tuple[dict, str]:
     return _osascript_pipe(script), original_action
 
 
+def _wants_project_creation(command: str) -> bool:
+    """Detect if user wants to create a coding project/app."""
+    cl = command.lower()
+    create_words = ["create", "make", "build", "generate", "code"]
+    project_words = ["app", "application", "project", "website", "calculator", "game", "todo", "page", "site"]
+    has_create = any(w in cl for w in create_words)
+    has_project = any(w in cl for w in project_words)
+    return has_create and has_project
+
+
+def _generate_project_with_claude(command: str) -> dict:
+    """Use Claude to generate a complete project with multiple files."""
+    project_model = os.getenv("ANTHROPIC_SCRIPT_MODEL", "claude-haiku-4-5").strip()
+    
+    message = claude.messages.create(
+        model=project_model,
+        max_tokens=8000,
+        messages=[
+            {
+                "role": "user",
+                "content": f"""You are creating a web project based on this request: {command}
+
+Create a SINGLE index.html file that contains EVERYTHING inline:
+- All CSS in a <style> tag
+- All JavaScript in a <script> tag  
+- Complete, working, polished code
+
+Requirements:
+- Dark modern UI with good styling
+- Fully functional (not placeholder code)
+- Mobile-friendly
+- Professional looking
+
+Return ONLY valid JSON in this exact format:
+{{
+    "project_name": "FolderName",
+    "description": "One sentence description",
+    "index_html": "<!DOCTYPE html>... complete HTML file content ..."
+}}
+
+CRITICAL: 
+- Escape all quotes inside the HTML string properly
+- Use single quotes inside HTML attributes when possible
+- The index_html must be valid JSON string (escape newlines as \\n, quotes as \\")
+- Return ONLY the JSON, no markdown code blocks"""
+            }
+        ],
+    )
+    
+    raw = message.content[0].text
+    print(f"PROJECT GENERATION RESPONSE LENGTH: {len(raw)}")
+    
+    # Try to parse as JSON first
+    try:
+        # Clean up markdown code blocks
+        clean = raw.strip()
+        if clean.startswith("```"):
+            lines = clean.split("\n", 1)
+            if len(lines) > 1:
+                clean = lines[1]
+        if clean.rstrip().endswith("```"):
+            clean = clean.rstrip()[:-3].rstrip()
+        
+        start = clean.find("{")
+        end = clean.rfind("}") + 1
+        if start != -1 and end > start:
+            clean = clean[start:end]
+        
+        return json.loads(clean)
+    except json.JSONDecodeError as e:
+        print(f"JSON parsing failed: {e}")
+        print("Extracting HTML directly...")
+        
+        # Try to get project name from response
+        name_match = re.search(r'"project_name"\s*:\s*"([^"]+)"', raw)
+        project_name = name_match.group(1) if name_match else "WebApp"
+        
+        # The HTML is likely escaped in JSON format - extract it
+        html_match = re.search(r'"index_html"\s*:\s*"(.*?)(?:"\s*[,}]|\Z)', raw, re.DOTALL)
+        if html_match:
+            html_escaped = html_match.group(1)
+            # Unescape JSON string escapes
+            html_content = html_escaped.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace("\\'", "'").replace('\\\\', '\\')
+            if '<!DOCTYPE' in html_content or '<html' in html_content.lower():
+                print(f"Extracted HTML: {len(html_content)} chars")
+                return {
+                    "project_name": project_name,
+                    "description": "Generated web application",
+                    "index_html": html_content
+                }
+        
+        # Fallback: look for raw HTML (unescaped)
+        html_match = re.search(r'<!DOCTYPE html>.*?</html>', raw, re.DOTALL | re.IGNORECASE)
+        if html_match:
+            return {
+                "project_name": project_name,
+                "description": "Generated web application",
+                "index_html": html_match.group(0)
+            }
+        
+        # Last resort: look for any HTML-like content
+        if "<html" in raw.lower():
+            start = raw.lower().find("<html")
+            end = raw.lower().rfind("</html>") + 7
+            if end > start:
+                return {
+                    "project_name": project_name,
+                    "description": "Generated web application", 
+                    "index_html": raw[start:end]
+                }
+        
+        print(f"RAW RESPONSE SAMPLE: {raw[:1000]}")
+        raise ValueError("Could not extract HTML from response")
+
+
+def _wants_git_command(command: str) -> bool:
+    """Detect if user wants to run a git command."""
+    cl = command.lower()
+    
+    # Explicit git commands - check these FIRST
+    git_phrases = [
+        "git status", 
+        "git diff", 
+        "git pull",
+        "git push",
+        "push to github", 
+        "commit changes", 
+        "commit my changes",
+        "commit the changes",
+        "push changes",
+        "pull changes",
+        "pull from github",
+        "commit in ",
+        "push in ",
+        "status for ",
+        "status of ",
+        "with message",  # "commit ... with message ..."
+    ]
+    if any(phrase in cl for phrase in git_phrases):
+        return True
+    
+    # Pattern: "commit ... message" (git commit message pattern)
+    if re.search(r'\bcommit\b.*\bmessage\b', cl):
+        return True
+    
+    # Pattern: "push [something] to github"
+    if re.search(r'\bpush\b.*\bto\s+github\b', cl):
+        return True
+    
+    # If it's a text/SMS message command, don't route to git
+    text_indicators = ["text ", "send a text", "send text", "sms ", "imessage ", "send a message"]
+    if any(t in cl for t in text_indicators):
+        return False
+    
+    # If it mentions opening Messages app, don't route to git
+    if "open " in cl and "messages" in cl:
+        return False
+        
+    return False
+
+
+def _parse_git_command(command: str) -> dict:
+    """Parse a natural language git command into action and parameters."""
+    cl = command.lower()
+    
+    result = {
+        "action": None,
+        "message": None,
+        "folder": None,
+    }
+    
+    # Detect action
+    if "push" in cl:
+        result["action"] = "push"
+    elif "pull" in cl:
+        result["action"] = "pull"
+    elif "status" in cl:
+        result["action"] = "status"
+    elif "diff" in cl:
+        result["action"] = "diff"
+    elif "commit" in cl:
+        result["action"] = "commit"
+        # Extract commit message
+        patterns = [
+            r'message\s+["\']?([^"\']+)["\']?',
+            r'saying\s+["\']?([^"\']+)["\']?',
+            r'with\s+["\']([^"\']+)["\']',
+            r'commit\s+["\']([^"\']+)["\']',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, command, re.I)
+            if match:
+                result["message"] = match.group(1).strip()
+                break
+        if not result["message"]:
+            # Try to get text after "message" or "saying"
+            after_msg = re.search(r'(?:message|saying|with message)\s+(.+?)(?:\s+(?:in|for|to)\s|$)', command, re.I)
+            if after_msg:
+                result["message"] = after_msg.group(1).strip().strip('"\'')
+    
+    # Detect folder
+    folder_patterns = [
+        r'(?:in|for|from)\s+(?:the\s+)?(?:folder\s+)?["\']?([^"\']+?)["\']?\s*(?:folder|project|repo)?(?:\s|$)',
+        r'(?:folder|project|repo)\s+(?:called\s+)?["\']?([^"\']+)["\']?',
+        r'\bpush\s+([A-Za-z0-9_-]+)\s+to\s+github\b',  # "push ProjectName to github"
+        r'\bstatus\s+(?:for|of)\s+([A-Za-z0-9_-]+)\b',  # "status for ProjectName"
+    ]
+    for pattern in folder_patterns:
+        match = re.search(pattern, command, re.I)
+        if match:
+            folder = match.group(1).strip()
+            # Clean up common words
+            folder = re.sub(r'\s*(folder|project|repo|repository|changes?|and|then|push).*$', '', folder, flags=re.I).strip()
+            if folder and len(folder) > 1:
+                result["folder"] = folder
+                break
+    
+    return result
+
+
+@app.post("/git-command")
+async def git_command(data: dict):
+    """Execute git commands remotely."""
+    command = data.get("command", "")
+    if not command.strip():
+        return {"error": "No command provided"}
+    
+    print(f"\n{'='*60}")
+    print(f"GIT COMMAND: {command}")
+    print(f"{'='*60}")
+    
+    parsed = _parse_git_command(command)
+    action = parsed.get("action")
+    message = parsed.get("message")
+    folder_name = parsed.get("folder")
+    
+    print(f"PARSED: action={action}, message={message}, folder={folder_name}")
+    
+    if not action:
+        return {"transcript": command, "error": "Could not understand git command. Try: 'commit changes with message fixed the bug' or 'push to github'"}
+    
+    # Determine working directory
+    desktop = Path.home() / "Desktop"
+    work_dir = None
+    
+    if folder_name:
+        # Check Desktop first
+        potential_path = desktop / folder_name
+        if potential_path.exists() and potential_path.is_dir():
+            work_dir = potential_path
+        else:
+            # Check Documents
+            docs_path = Path.home() / "Documents" / folder_name
+            if docs_path.exists() and docs_path.is_dir():
+                work_dir = docs_path
+            else:
+                # Try to find it
+                for search_dir in [desktop, Path.home() / "Documents", Path.home() / "Projects"]:
+                    if search_dir.exists():
+                        for item in search_dir.iterdir():
+                            if item.is_dir() and folder_name.lower() in item.name.lower():
+                                work_dir = item
+                                break
+                    if work_dir:
+                        break
+    
+    if not work_dir:
+        # Default to most recently modified git repo on Desktop
+        git_repos = []
+        if desktop.exists():
+            for item in desktop.iterdir():
+                if item.is_dir() and (item / ".git").exists():
+                    git_repos.append(item)
+        
+        if git_repos:
+            # Sort by modification time, most recent first
+            git_repos.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            work_dir = git_repos[0]
+        else:
+            return {"transcript": command, "error": "No git repository found. Specify a folder: 'commit changes in MyProject with message updated code'"}
+    
+    # Verify it's a git repo
+    if not (work_dir / ".git").exists():
+        return {"transcript": command, "error": f"'{work_dir.name}' is not a git repository"}
+    
+    print(f"WORKING DIR: {work_dir}")
+    
+    try:
+        if action == "status":
+            result = subprocess.run(
+                ["git", "status", "--short"],
+                cwd=str(work_dir),
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            status_output = result.stdout.strip() or "No changes"
+            return {
+                "transcript": command,
+                "action": f"Git status for {work_dir.name}:\n{status_output}",
+                "osascript_ok": result.returncode == 0,
+                "result": status_output
+            }
+        
+        elif action == "diff":
+            result = subprocess.run(
+                ["git", "diff", "--stat"],
+                cwd=str(work_dir),
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            diff_output = result.stdout.strip() or "No changes"
+            return {
+                "transcript": command,
+                "action": f"Git diff for {work_dir.name}:\n{diff_output}",
+                "osascript_ok": result.returncode == 0,
+                "result": diff_output
+            }
+        
+        elif action == "commit":
+            if not message:
+                return {"transcript": command, "error": "Please provide a commit message: 'commit changes with message your message here'"}
+            
+            # Stage all changes
+            subprocess.run(["git", "add", "-A"], cwd=str(work_dir), capture_output=True, timeout=30)
+            
+            # Check if there's anything to commit
+            status = subprocess.run(["git", "status", "--porcelain"], cwd=str(work_dir), capture_output=True, text=True, timeout=30)
+            if not status.stdout.strip():
+                return {"transcript": command, "action": f"No changes to commit in {work_dir.name}", "osascript_ok": True}
+            
+            # Commit
+            result = subprocess.run(
+                ["git", "commit", "-m", message],
+                cwd=str(work_dir),
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0:
+                return {
+                    "transcript": command,
+                    "action": f"Committed to {work_dir.name} with message: '{message}'",
+                    "osascript_ok": True,
+                    "result": result.stdout
+                }
+            else:
+                return {
+                    "transcript": command,
+                    "error": f"Commit failed: {result.stderr}",
+                    "osascript_ok": False
+                }
+        
+        elif action == "push":
+            result = subprocess.run(
+                ["git", "push"],
+                cwd=str(work_dir),
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            
+            if result.returncode == 0:
+                return {
+                    "transcript": command,
+                    "action": f"Pushed {work_dir.name} to GitHub",
+                    "osascript_ok": True,
+                    "result": result.stdout or result.stderr
+                }
+            else:
+                return {
+                    "transcript": command,
+                    "error": f"Push failed: {result.stderr}",
+                    "osascript_ok": False
+                }
+        
+        elif action == "pull":
+            result = subprocess.run(
+                ["git", "pull"],
+                cwd=str(work_dir),
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            
+            if result.returncode == 0:
+                return {
+                    "transcript": command,
+                    "action": f"Pulled latest changes for {work_dir.name}",
+                    "osascript_ok": True,
+                    "result": result.stdout
+                }
+            else:
+                return {
+                    "transcript": command,
+                    "error": f"Pull failed: {result.stderr}",
+                    "osascript_ok": False
+                }
+        
+    except subprocess.TimeoutExpired:
+        return {"transcript": command, "error": "Git command timed out"}
+    except Exception as e:
+        return {"transcript": command, "error": str(e)}
+    
+    return {"transcript": command, "error": "Unknown git action"}
+
+
+@app.post("/create-project")
+async def create_project(data: dict):
+    """Create a complete web project from a description."""
+    command = data.get("command", "")
+    if not command.strip():
+        return {"error": "No project description provided"}
+    
+    print(f"\n{'='*60}")
+    print(f"CREATE PROJECT: {command}")
+    print(f"{'='*60}")
+    
+    try:
+        project = _generate_project_with_claude(command)
+        project_name = project.get("project_name", "MyProject")
+        description = project.get("description", "")
+        index_html = project.get("index_html", "")
+        
+        # Create folder on Desktop
+        desktop = Path.home() / "Desktop"
+        project_path = desktop / project_name
+        project_path.mkdir(exist_ok=True)
+        
+        # Write the HTML file
+        html_file = project_path / "index.html"
+        html_file.write_text(index_html)
+        
+        print(f"Created: {project_path}")
+        print(f"Files: index.html ({len(index_html)} chars)")
+        
+        # Open in VS Code
+        subprocess.run(["open", "-a", "Visual Studio Code", str(project_path)], check=False)
+        
+        # Open in Chrome
+        subprocess.run(["open", "-a", "Google Chrome", str(html_file)], check=False)
+        
+        return {
+            "transcript": command,
+            "action": f"Created {project_name} on Desktop with index.html, opened in VS Code and Chrome",
+            "project_path": str(project_path),
+            "description": description,
+            "osascript_ok": True
+        }
+        
+    except json.JSONDecodeError as e:
+        print(f"JSON ERROR: {e}")
+        return {"transcript": command, "error": f"Failed to parse project: {e}"}
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return {"transcript": command, "error": str(e)}
+
+
+def _wants_spotify_control(command: str) -> bool:
+    """Detect if user wants to control Spotify."""
+    cl = command.lower()
+    if "spotify" not in cl:
+        return False
+    action_words = ["play", "search", "open", "pause", "skip", "next", "previous", "shuffle", "repeat", "library", "playlist", "liked"]
+    return any(w in cl for w in action_words)
+
+
+def _parse_spotify_command(command: str) -> dict:
+    """Parse a Spotify command."""
+    cl = command.lower()
+    result = {"action": None, "query": None, "playlist": None}
+    
+    # Detect action
+    if "pause" in cl or "stop" in cl:
+        result["action"] = "pause"
+    elif "skip" in cl or "next" in cl:
+        result["action"] = "next"
+    elif "previous" in cl or "back" in cl:
+        result["action"] = "previous"
+    elif "shuffle" in cl:
+        result["action"] = "shuffle"
+    elif "play" in cl or "search" in cl:
+        result["action"] = "play"
+        
+        # Check for playlist
+        playlist_match = re.search(r'(?:play|open)\s+(?:my\s+)?(?:playlist\s+)?["\']?([^"\']+?)["\']?\s+playlist', command, re.I)
+        if playlist_match:
+            result["playlist"] = playlist_match.group(1).strip()
+            result["action"] = "playlist"
+        elif "liked songs" in cl or "liked" in cl:
+            result["action"] = "liked"
+        else:
+            # Extract song/artist query
+            patterns = [
+                r'play\s+(.+?)(?:\s+on\s+spotify|\s*$)',
+                r'search\s+(?:for\s+)?(.+?)(?:\s+on\s+spotify|\s*$)',
+                r'spotify\s+(?:and\s+)?play\s+(.+?)(?:\s*$)',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, command, re.I)
+                if match:
+                    query = match.group(1).strip()
+                    # Clean up common words
+                    query = re.sub(r'\s*(?:on spotify|in spotify).*$', '', query, flags=re.I).strip()
+                    if query and query.lower() != "spotify":
+                        result["query"] = query
+                        break
+    
+    return result
+
+
+@app.post("/spotify-control")
+async def spotify_control(data: dict):
+    """Control Spotify with search and playback."""
+    command = data.get("command", "")
+    if not command.strip():
+        return {"error": "No command provided"}
+    
+    print(f"\n{'='*60}")
+    print(f"SPOTIFY: {command}")
+    print(f"{'='*60}")
+    
+    parsed = _parse_spotify_command(command)
+    action = parsed.get("action")
+    query = parsed.get("query")
+    playlist = parsed.get("playlist")
+    
+    print(f"PARSED: action={action}, query={query}, playlist={playlist}")
+    
+    if action == "pause":
+        script = 'tell application "Spotify" to pause'
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+        return {"transcript": command, "action": "Paused Spotify", "osascript_ok": result.returncode == 0}
+    
+    elif action == "next":
+        script = 'tell application "Spotify" to next track'
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+        return {"transcript": command, "action": "Skipped to next track", "osascript_ok": result.returncode == 0}
+    
+    elif action == "previous":
+        script = 'tell application "Spotify" to previous track'
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+        return {"transcript": command, "action": "Playing previous track", "osascript_ok": result.returncode == 0}
+    
+    elif action == "shuffle":
+        script = '''
+        tell application "Spotify"
+            set shuffling to not shuffling
+            if shuffling then
+                return "on"
+            else
+                return "off"
+            end if
+        end tell
+        '''
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+        state = result.stdout.strip()
+        return {"transcript": command, "action": f"Shuffle turned {state}", "osascript_ok": result.returncode == 0}
+    
+    elif action == "liked":
+        # Open liked songs
+        script = '''
+        tell application "Spotify"
+            activate
+            delay 0.5
+        end tell
+        tell application "System Events"
+            tell process "Spotify"
+                keystroke "l" using {command down, shift down}
+            end tell
+        end tell
+        delay 1
+        tell application "Spotify" to play
+        '''
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+        return {"transcript": command, "action": "Playing your Liked Songs", "osascript_ok": result.returncode == 0}
+    
+    elif action == "play" and query:
+        # Search and play
+        escaped_query = query.replace('"', '\\"').replace("'", "'")
+        script = f'''
+        tell application "Spotify"
+            activate
+            delay 1
+        end tell
+        tell application "System Events"
+            tell process "Spotify"
+                -- Open search with Cmd+K (Spotify's search shortcut)
+                keystroke "k" using {{command down}}
+                delay 0.5
+                -- Clear existing text
+                keystroke "a" using {{command down}}
+                delay 0.2
+                -- Type search query
+                keystroke "{escaped_query}"
+                delay 1.5
+                -- Press Enter to play top result
+                key code 36
+            end tell
+        end tell
+        '''
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=20)
+        
+        if result.returncode == 0:
+            return {
+                "transcript": command,
+                "action": f"Searching and playing '{query}' on Spotify",
+                "osascript_ok": True
+            }
+        else:
+            return {
+                "transcript": command,
+                "error": f"Spotify control failed: {result.stderr}",
+                "osascript_ok": False,
+                "hint": "Make sure Spotify is installed and you've granted Accessibility permissions in System Settings > Privacy & Security > Accessibility"
+            }
+    
+    elif action == "playlist" and playlist:
+        # Search for playlist
+        escaped_playlist = playlist.replace('"', '\\"').replace("'", "'")
+        script = f'''
+        tell application "Spotify"
+            activate
+            delay 1
+        end tell
+        tell application "System Events"
+            tell process "Spotify"
+                keystroke "k" using {{command down}}
+                delay 0.5
+                keystroke "a" using {{command down}}
+                delay 0.2
+                keystroke "{escaped_playlist} playlist"
+                delay 1.5
+                -- Navigate down to first result
+                key code 125
+                delay 0.3
+                -- Press Enter to open playlist
+                key code 36
+                delay 1
+                -- Press play button (space or Enter)
+                key code 36
+            end tell
+        end tell
+        '''
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=20)
+        return {
+            "transcript": command,
+            "action": f"Playing playlist '{playlist}'",
+            "osascript_ok": result.returncode == 0
+        }
+    
+    else:
+        # Just open Spotify
+        script = 'tell application "Spotify" to activate'
+        subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+        return {"transcript": command, "action": "Opened Spotify", "osascript_ok": True}
+
+
+def _wants_text_message(command: str) -> bool:
+    """Detect if user wants to send a text/iMessage."""
+    cl = command.lower()
+    patterns = [
+        r'\btext\s+\w+',
+        r'\bmessage\s+\w+',
+        r'\bsend\s+(?:a\s+)?(?:text|message|sms)',
+        r'\bitext\s+',
+        r'\bimessage\s+',
+    ]
+    return any(re.search(p, cl) for p in patterns)
+
+
+def _parse_text_message(command: str) -> dict:
+    """Parse a text message command into recipient and message."""
+    result = {"recipient": None, "message": None, "is_phone": False}
+    
+    # Check for phone number pattern
+    phone_match = re.search(r'(\+?1?[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})', command)
+    if phone_match:
+        # Clean up phone number
+        phone = re.sub(r'[^\d+]', '', phone_match.group(1))
+        if not phone.startswith('+'):
+            if len(phone) == 10:
+                phone = '+1' + phone
+            elif len(phone) == 11 and phone.startswith('1'):
+                phone = '+' + phone
+        result["recipient"] = phone
+        result["is_phone"] = True
+    
+    # Extract message content
+    message_patterns = [
+        r'(?:saying|say|with message|message:?)\s+["\']?(.+?)["\']?\s*$',
+        r'(?:text|message)\s+(?:\S+\s+)?(?:saying|say)\s+["\']?(.+?)["\']?\s*$',
+    ]
+    for pattern in message_patterns:
+        match = re.search(pattern, command, re.I)
+        if match:
+            result["message"] = match.group(1).strip().strip('"\'')
+            break
+    
+    # Extract recipient name if no phone number
+    if not result["is_phone"]:
+        # Pattern: "text [name] saying..." or "message [name] saying..."
+        name_match = re.search(r'(?:text|message|imessage|send\s+(?:a\s+)?(?:text|message)\s+to)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)\s+(?:saying|say|with)', command, re.I)
+        if name_match:
+            result["recipient"] = name_match.group(1).strip()
+    
+    return result
+
+
+def _lookup_contact_phone(name: str) -> str | None:
+    """Look up a contact's phone number from Contacts app."""
+    script = f'''
+    tell application "Contacts"
+        try
+            set matchingPeople to (every person whose name contains "{name}")
+            if (count of matchingPeople) > 0 then
+                set thePerson to item 1 of matchingPeople
+                set thePhones to phones of thePerson
+                if (count of thePhones) > 0 then
+                    return value of item 1 of thePhones
+                end if
+            end if
+        end try
+        return ""
+    end tell
+    '''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        phone = result.stdout.strip()
+        if phone:
+            # Clean up phone number
+            phone = re.sub(r'[^\d+]', '', phone)
+            if not phone.startswith('+'):
+                if len(phone) == 10:
+                    phone = '+1' + phone
+                elif len(phone) == 11 and phone.startswith('1'):
+                    phone = '+' + phone
+            return phone
+    except Exception as e:
+        print(f"Contact lookup error: {e}")
+    return None
+
+
+@app.post("/send-message")
+async def send_message(data: dict):
+    """Send an iMessage to a contact by name or phone number."""
+    command = data.get("command", "")
+    if not command.strip():
+        return {"error": "No command provided"}
+    
+    print(f"\n{'='*60}")
+    print(f"SEND MESSAGE: {command}")
+    print(f"{'='*60}")
+    
+    parsed = _parse_text_message(command)
+    recipient = parsed.get("recipient")
+    message = parsed.get("message")
+    is_phone = parsed.get("is_phone", False)
+    
+    print(f"PARSED: recipient={recipient}, message={message}, is_phone={is_phone}")
+    
+    if not recipient:
+        return {"transcript": command, "error": "Could not find recipient. Try: 'text John saying hello' or 'text 555-123-4567 saying hello'"}
+    
+    if not message:
+        return {"transcript": command, "error": "Could not find message. Try: 'text John saying hello'"}
+    
+    # Look up phone number if name was provided
+    phone = recipient if is_phone else None
+    contact_name = None if is_phone else recipient
+    
+    if not is_phone:
+        print(f"Looking up contact: {recipient}")
+        phone = _lookup_contact_phone(recipient)
+        if phone:
+            print(f"Found phone: {phone}")
+            contact_name = recipient
+        else:
+            return {
+                "transcript": command,
+                "error": f"Could not find '{recipient}' in your Contacts. Make sure the name matches a contact, or use their phone number directly."
+            }
+    
+    # Send the message
+    escaped_message = message.replace('"', '\\"')
+    script = f'''
+    tell application "Messages"
+        set targetService to 1st account whose service type = iMessage
+        set targetBuddy to participant "{phone}" of targetService
+        send "{escaped_message}" to targetBuddy
+    end tell
+    '''
+    
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        
+        if result.returncode == 0:
+            display_recipient = contact_name if contact_name else phone
+            return {
+                "transcript": command,
+                "action": f"Sent message to {display_recipient}: \"{message}\"",
+                "osascript_ok": True
+            }
+        else:
+            return {
+                "transcript": command,
+                "error": f"Failed to send: {result.stderr}",
+                "osascript_ok": False
+            }
+    except Exception as e:
+        return {"transcript": command, "error": str(e)}
+
+
 @app.post("/text-command")
 async def text_command(data: dict):
     command = data.get("command", "")
     if not command.strip():
         return {"error": "No command provided"}
+    
+    print(f"\n{'='*60}")
+    print(f"COMMAND: {command}")
+    print(f"{'='*60}")
+    
+    # Handle "end all sessions" / "close everything" commands
+    cl = command.lower()
+    if any(phrase in cl for phrase in ["end all sessions", "close everything", "close all apps", "quit everything", "quit all apps", "close all windows"]):
+        print("ROUTING TO: end-all-sessions")
+        script = '''
+        tell application "System Events"
+            set appList to name of every application process whose visible is true and name is not "Finder"
+        end tell
+        repeat with appName in appList
+            try
+                tell application appName to quit
+            end try
+        end repeat
+        '''
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=30)
+        return {
+            "transcript": command,
+            "action": "Closed all open applications",
+            "osascript_ok": result.returncode == 0
+        }
+    
+    # Route git commands FIRST (before text message to avoid "with message" conflict)
+    if _wants_git_command(command):
+        print("ROUTING TO: git-command")
+        return await git_command(data)
+    
+    # Route Spotify commands to the dedicated handler
+    if _wants_spotify_control(command):
+        print("ROUTING TO: spotify-control")
+        return await spotify_control(data)
+    
+    # Route text/iMessage commands to the dedicated handler
+    if _wants_text_message(command):
+        print("ROUTING TO: send-message")
+        return await send_message(data)
+    
+    # Route project creation requests to the dedicated handler
+    if _wants_project_creation(command):
+        print("ROUTING TO: create-project")
+        return await create_project(data)
+    
     try:
         script, action = get_applescript(command)
+        print(f"ACTION: {action}")
+        print(f"SCRIPT:\n{script[:500]}{'...' if len(script) > 500 else ''}")
     except Exception as e:
+        print(f"ERROR: {e}")
         return {"transcript": command, "error": f"Claude: {e}"}
+    
     result, _ = run_applescript(script, action)
+    
+    if result["returncode"] != 0:
+        print(f"APPLESCRIPT ERROR: {result.get('stderr', '')}")
+    else:
+        print("SUCCESS")
+    print(f"{'='*60}\n")
+    
     return {
         "transcript": command,
         "action": action,
