@@ -47,6 +47,82 @@
         .status.connected { color: #30d158; }
         .status.error { color: #ff453a; }
 
+        .navigation {
+            margin-top: 12px;
+            padding: 8px 16px;
+            background: #1c1c1e;
+            border-radius: 20px;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            max-width: 90%;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .nav-icon {
+            width: 20px;
+            height: 20px;
+            border-radius: 4px;
+            background: #333;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+        }
+
+        .nav-path {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: #888;
+            overflow: hidden;
+        }
+
+        .nav-item {
+            color: #fff;
+            white-space: nowrap;
+        }
+
+        .nav-item.active {
+            color: #0a84ff;
+            font-weight: 500;
+        }
+
+        .nav-separator {
+            color: #555;
+        }
+
+        .nav-typing {
+            display: none;
+            align-items: center;
+            gap: 6px;
+            margin-left: 8px;
+            color: #ffd60a;
+            font-size: 11px;
+        }
+
+        .nav-typing.show {
+            display: flex;
+        }
+
+        .typing-dot {
+            width: 4px;
+            height: 4px;
+            background: #ffd60a;
+            border-radius: 50%;
+            animation: typing-pulse 1s infinite;
+        }
+
+        .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+        .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes typing-pulse {
+            0%, 100% { opacity: 0.3; }
+            50% { opacity: 1; }
+        }
+
         .feed {
             flex: 1;
             overflow-y: auto;
@@ -232,6 +308,18 @@
         <div class="title">Imperium</div>
         <div class="subtitle">Text-based AI Agent</div>
         <div class="status" id="status">Connecting...</div>
+        <div class="navigation" id="navigation" style="display: none;">
+            <div class="nav-icon" id="navIcon">🖥️</div>
+            <div class="nav-path" id="navPath">
+                <span class="nav-item" id="navApp">—</span>
+            </div>
+            <div class="nav-typing" id="navTyping">
+                <div class="typing-dot"></div>
+                <div class="typing-dot"></div>
+                <div class="typing-dot"></div>
+                <span>typing</span>
+            </div>
+        </div>
     </div>
 
     <div class="feed" id="feed">
@@ -269,9 +357,148 @@
         const inputEl = document.getElementById("commandInput");
         const sendBtn = document.getElementById("sendBtn");
         const editingHint = document.getElementById("editingHint");
+        const navigationEl = document.getElementById("navigation");
+        const navIconEl = document.getElementById("navIcon");
+        const navPathEl = document.getElementById("navPath");
+        const navTypingEl = document.getElementById("navTyping");
 
         let isProcessing = false;
         let editingWrapper = null;
+        let currentApp = null;
+        let currentPage = null;
+
+        const appIcons = {
+            "chrome": "🌐",
+            "google chrome": "🌐",
+            "safari": "🧭",
+            "youtube": "▶️",
+            "spotify": "🎵",
+            "mail": "✉️",
+            "messages": "💬",
+            "notes": "📝",
+            "finder": "📁",
+            "terminal": "⬛",
+            "vscode": "💻",
+            "visual studio code": "💻",
+            "slack": "💼",
+            "discord": "🎮",
+            "zoom": "📹",
+            "facetime": "📱",
+            "calendar": "📅",
+            "reminders": "☑️",
+            "photos": "🖼️",
+            "music": "🎵",
+            "podcasts": "🎙️",
+            "maps": "🗺️",
+            "twitter": "🐦",
+            "x": "🐦",
+            "facebook": "📘",
+            "instagram": "📷",
+            "linkedin": "💼",
+            "github": "🐙",
+            "notion": "📓",
+            "figma": "🎨",
+            "default": "🖥️"
+        };
+
+        function getAppIcon(appName) {
+            if (!appName) return appIcons.default;
+            const lower = appName.toLowerCase();
+            for (const [key, icon] of Object.entries(appIcons)) {
+                if (lower.includes(key)) return icon;
+            }
+            return appIcons.default;
+        }
+
+        function updateNavigation(app, page = null, isTyping = false) {
+            if (!app && !page) {
+                navigationEl.style.display = "none";
+                return;
+            }
+
+            navigationEl.style.display = "inline-flex";
+            currentApp = app || currentApp;
+            currentPage = page;
+
+            navIconEl.textContent = getAppIcon(currentApp || currentPage);
+
+            let pathHTML = "";
+            if (currentApp) {
+                pathHTML += `<span class="nav-item ${!currentPage ? 'active' : ''}">${currentApp}</span>`;
+            }
+            if (currentPage && currentPage !== currentApp) {
+                if (currentApp) {
+                    pathHTML += `<span class="nav-separator">›</span>`;
+                }
+                pathHTML += `<span class="nav-item active">${currentPage}</span>`;
+            }
+            navPathEl.innerHTML = pathHTML;
+
+            if (isTyping) {
+                navTypingEl.classList.add("show");
+            } else {
+                navTypingEl.classList.remove("show");
+            }
+        }
+
+        function parseNavigationFromAction(action, command) {
+            if (!action) return { app: null, page: null };
+
+            const actionLower = action.toLowerCase();
+            const commandLower = command.toLowerCase();
+            
+            let app = null;
+            let page = null;
+
+            // Detect app from action
+            const appPatterns = [
+                { pattern: /opened?\s+([\w\s]+?)(?:\s+in|\s+at|\s*$)/i, group: 1 },
+                { pattern: /playing\s+.*?\s+on\s+(spotify)/i, group: 1 },
+                { pattern: /searching\s+.*?\s+on\s+(spotify)/i, group: 1 },
+                { pattern: /(chrome|safari|spotify|mail|messages|notes|finder|terminal)/i, group: 1 },
+            ];
+
+            for (const { pattern, group } of appPatterns) {
+                const match = action.match(pattern);
+                if (match) {
+                    app = match[group].trim();
+                    break;
+                }
+            }
+
+            // Detect specific pages/sites
+            const pagePatterns = [
+                { pattern: /youtube/i, page: "YouTube" },
+                { pattern: /google\.com|google search/i, page: "Google" },
+                { pattern: /twitter|x\.com/i, page: "Twitter/X" },
+                { pattern: /facebook/i, page: "Facebook" },
+                { pattern: /instagram/i, page: "Instagram" },
+                { pattern: /linkedin/i, page: "LinkedIn" },
+                { pattern: /github/i, page: "GitHub" },
+                { pattern: /reddit/i, page: "Reddit" },
+                { pattern: /netflix/i, page: "Netflix" },
+                { pattern: /amazon/i, page: "Amazon" },
+                { pattern: /gmail/i, page: "Gmail" },
+                { pattern: /claude\.ai/i, page: "Claude" },
+                { pattern: /chatgpt|openai/i, page: "ChatGPT" },
+            ];
+
+            for (const { pattern, page: pageName } of pagePatterns) {
+                if (pattern.test(action) || pattern.test(command)) {
+                    page = pageName;
+                    if (!app) app = "Chrome";
+                    break;
+                }
+            }
+
+            // Clean up app name
+            if (app) {
+                app = app.replace(/\s+(app|application)$/i, "").trim();
+                app = app.charAt(0).toUpperCase() + app.slice(1);
+            }
+
+            return { app, page };
+        }
 
         function setStatus(msg, type = "") {
             statusEl.textContent = msg;
@@ -413,6 +640,12 @@
             inputEl.value = "";
             
             const processingWrapper = addResponse("Processing...", "processing", null);
+            
+            // Show processing state in navigation
+            const { app: previewApp, page: previewPage } = parseNavigationFromAction("", command);
+            if (previewApp || previewPage) {
+                updateNavigation(previewApp || currentApp, previewPage, false);
+            }
 
             try {
                 const res = await fetch(`${SERVER_URL}/text-command`, {
@@ -437,6 +670,13 @@
                     addResponse(errMsg, "error", userWrapper);
                 } else if (data.action) {
                     addResponse(`✓ ${data.action}`, "success", userWrapper);
+                    
+                    // Update navigation based on action
+                    const { app, page } = parseNavigationFromAction(data.action, command);
+                    const isTyping = data.visual_typing === true;
+                    if (app || page) {
+                        updateNavigation(app, page, isTyping);
+                    }
                 } else {
                     addResponse("✓ Command executed", "success", userWrapper);
                 }

@@ -5,11 +5,13 @@ import json
 import os
 import re
 import subprocess
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import anthropic
 import httpx
+import pyautogui
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -17,7 +19,114 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
+# Configure pyautogui for smoother typing
+pyautogui.PAUSE = 0.0  # No pause between pyautogui calls
+pyautogui.FAILSAFE = True  # Move mouse to corner to abort
+
 load_dotenv()
+
+# Visual typing threshold - use pyautogui for text <= this length
+# Set VISUAL_TYPING_THRESHOLD in .env to customize (default: 1000)
+VISUAL_TYPING_THRESHOLD = int(os.getenv("VISUAL_TYPING_THRESHOLD", "1000"))
+
+
+def type_with_pyautogui(text: str, interval: float = 0.015) -> None:
+    """
+    Type text visually using pyautogui so user can see each character.
+    
+    Args:
+        text: The text to type
+        interval: Delay between each character (default 0.02 = 50 chars/second)
+    """
+    for char in text:
+        pyautogui.write(char, interval=0)
+        time.sleep(interval)
+
+
+def _extract_email_content(transcript: str) -> dict:
+    """
+    Extract email components (recipient, subject, body) from transcript.
+    Returns dict with keys: recipient, subject, body, has_attachment, attachment_file
+    """
+    result = {
+        "recipient": None,
+        "subject": None,
+        "body": None,
+        "has_attachment": False,
+        "attachment_file": None,
+    }
+    
+    transcript_lower = transcript.lower()
+    
+    # Check for attachment
+    if "attach" in transcript_lower or "attachment" in transcript_lower:
+        result["has_attachment"] = True
+        # Try to find filename
+        file_match = re.search(r'attach(?:ing|ment)?\s+(?:the\s+)?(?:file\s+)?["\']?([^"\']+\.\w+)["\']?', transcript, re.I)
+        if file_match:
+            result["attachment_file"] = file_match.group(1).strip()
+    
+    # Extract recipient email
+    email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', transcript)
+    if email_match:
+        result["recipient"] = email_match.group(0)
+    else:
+        # Try "to [name]" pattern
+        to_match = re.search(r'\bto\s+([A-Za-z\s]+?)(?:\s+(?:with|about|saying|subject|body|regarding)|$)', transcript, re.I)
+        if to_match:
+            result["recipient"] = to_match.group(1).strip()
+    
+    # Extract subject
+    subject_patterns = [
+        r'subject\s*[:\-]?\s*["\']?([^"\']+?)["\']?\s*(?:body|saying|and|$)',
+        r'subject\s+(?:is\s+)?["\']?([^"\']+?)["\']?\s*(?:body|saying|and|$)',
+        r'about\s+["\']?([^"\']+?)["\']?\s*(?:body|saying|and|$)',
+    ]
+    for pattern in subject_patterns:
+        match = re.search(pattern, transcript, re.I)
+        if match:
+            result["subject"] = match.group(1).strip()
+            break
+    
+    # Extract body - look for content after "saying", "body:", "message:", etc.
+    body_patterns = [
+        r'(?:body|message|content|saying)\s*[:\-]?\s*["\'](.+?)["\'](?:\s*$|\s+and\s+send)',
+        r'(?:body|message|content|saying)\s*[:\-]?\s*["\'](.+)["\']',
+        r'(?:body|message|content|saying)\s*[:\-]?\s*(.+?)(?:\s+and\s+send|\s*$)',
+    ]
+    for pattern in body_patterns:
+        match = re.search(pattern, transcript, re.I | re.DOTALL)
+        if match:
+            body = match.group(1).strip()
+            if len(body) > 5:  # Minimum body length
+                result["body"] = body
+                break
+    
+    return result
+
+
+def _should_use_visual_typing(text: str | None) -> bool:
+    """Return True if we should use pyautogui visual typing for this text."""
+    if not text:
+        return False
+    return len(text) <= VISUAL_TYPING_THRESHOLD
+
+
+def _wants_email_compose(command: str) -> bool:
+    """Detect if user wants to compose/send an email."""
+    cl = command.lower()
+    email_triggers = [
+        "send an email",
+        "send email",
+        "compose email",
+        "write an email",
+        "write email",
+        "email to",
+        "draft an email",
+        "draft email",
+        "new email",
+    ]
+    return any(trigger in cl for trigger in email_triggers)
 
 from app_launcher import (
     build_in_app_action_script,
@@ -1571,6 +1680,145 @@ def _lookup_contact_phone(name: str) -> str | None:
     return None
 
 
+@app.post("/compose-email")
+async def compose_email(data: dict):
+    """
+    Compose and send an email with optional visual typing.
+    Uses pyautogui for body text <= 1000 chars so user can see typing.
+    """
+    command = data.get("command", "")
+    if not command.strip():
+        return {"error": "No command provided"}
+    
+    print(f"\n{'='*60}")
+    print(f"COMPOSE EMAIL: {command}")
+    print(f"{'='*60}")
+    
+    # Extract email components from the command
+    email_parts = _extract_email_content(command)
+    recipient = email_parts.get("recipient")
+    subject = email_parts.get("subject") or "No Subject"
+    body = email_parts.get("body") or ""
+    has_attachment = email_parts.get("has_attachment", False)
+    attachment_file = email_parts.get("attachment_file")
+    
+    print(f"EXTRACTED: to={recipient}, subject={subject}, body_len={len(body) if body else 0}")
+    
+    use_visual = _should_use_visual_typing(body)
+    print(f"VISUAL TYPING: {use_visual} (threshold={VISUAL_TYPING_THRESHOLD})")
+    
+    if use_visual and body:
+        # Two-step approach: AppleScript opens email without body, pyautogui types body
+        escaped_subject = subject.replace('"', '\\"')
+        escaped_recipient = (recipient or "").replace('"', '\\"')
+        
+        # Create email with empty body, leaving cursor in body field
+        if has_attachment and attachment_file:
+            script = f'''
+            tell application "Mail"
+                activate
+                set theMessage to make new outgoing message with properties {{subject:"{escaped_subject}", content:"", visible:true}}
+                tell theMessage
+                    make new to recipient at end of to recipients with properties {{address:"{escaped_recipient}"}}
+                    make new attachment with properties {{file name:POSIX file "/Users/jasmansidhu/Desktop/{attachment_file}"}} at after the last paragraph
+                end tell
+                delay 0.5
+            end tell
+            tell application "System Events"
+                tell process "Mail"
+                    -- Click into the body area (below subject)
+                    delay 0.3
+                    keystroke tab
+                    keystroke tab
+                    keystroke tab
+                end tell
+            end tell
+            '''
+        else:
+            script = f'''
+            tell application "Mail"
+                activate
+                set theMessage to make new outgoing message with properties {{subject:"{escaped_subject}", content:"", visible:true}}
+                tell theMessage
+                    make new to recipient at end of to recipients with properties {{address:"{escaped_recipient}"}}
+                end tell
+                delay 0.5
+            end tell
+            tell application "System Events"
+                tell process "Mail"
+                    -- Navigate to body field
+                    delay 0.3
+                    keystroke tab
+                    keystroke tab
+                    keystroke tab
+                end tell
+            end tell
+            '''
+        
+        # Execute setup script
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        
+        if result.returncode != 0:
+            print(f"Setup script failed: {result.stderr}")
+            return {"transcript": command, "error": f"Failed to open email: {result.stderr}", "osascript_ok": False}
+        
+        # Wait for Mail to be ready
+        time.sleep(0.5)
+        
+        # Type the body visually using pyautogui
+        print(f"TYPING BODY WITH PYAUTOGUI ({len(body)} chars)...")
+        type_with_pyautogui(body, interval=0.015)
+        
+        # Check if user wants to send immediately
+        wants_send = any(phrase in command.lower() for phrase in ["and send", "then send", "send it", "submit"])
+        
+        if wants_send:
+            time.sleep(0.3)
+            # Send with Cmd+Shift+D
+            send_script = '''
+            tell application "System Events"
+                tell process "Mail"
+                    keystroke "d" using {command down, shift down}
+                end tell
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", send_script], capture_output=True, timeout=5)
+            action_msg = f"Composed and sent email to {recipient}"
+        else:
+            action_msg = f"Composed email to {recipient} (ready to send)"
+        
+        return {
+            "transcript": command,
+            "action": action_msg,
+            "osascript_ok": True,
+            "visual_typing": True,
+            "body_length": len(body)
+        }
+    
+    else:
+        # Body > 1000 chars or empty - use normal AppleScript (instant)
+        print("USING NORMAL APPLESCRIPT (instant)")
+        # Fall through to regular AppleScript generation
+        try:
+            script, action = get_applescript(command)
+            result, _ = run_applescript(script, action)
+            return {
+                "transcript": command,
+                "action": action,
+                "result": result.get("stdout", ""),
+                "osascript_ok": result["returncode"] == 0,
+                "visual_typing": False,
+                "body_length": len(body) if body else 0
+            }
+        except Exception as e:
+            return {"transcript": command, "error": str(e)}
+
+
 @app.post("/send-message")
 async def send_message(data: dict):
     """Send an iMessage to a contact by name or phone number."""
@@ -1681,6 +1929,11 @@ async def text_command(data: dict):
     if _wants_git_command(command):
         print("ROUTING TO: git-command")
         return await git_command(data)
+    
+    # Route email commands to visual typing handler
+    if _wants_email_compose(command):
+        print("ROUTING TO: compose-email (visual typing enabled)")
+        return await compose_email(data)
     
     # Route Spotify commands to the dedicated handler
     if _wants_spotify_control(command):
